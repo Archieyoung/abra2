@@ -3,9 +3,9 @@
 
 SRCDIR=src/main/c
 
-all: clean native java
+all: native java
 
-java:
+java: native
 	mvn package
 
 mktargetdir:
