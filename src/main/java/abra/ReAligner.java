@@ -161,6 +161,13 @@ public class ReAligner {
 		logStartupInfo(outputFiles);
 				
 		String tempDir = init();
+		String parentDir = new File(outputFiles[0]).getParent();
+		tempDir = parentDir + File.separator + "abra2_tmp";
+		File tempDirFile = new File(tempDir);
+		if (!tempDirFile.exists()) {
+    		tempDirFile.mkdirs();
+		}
+
 		
 		c2r = new CompareToReference2();
 		c2r.init(this.reference);
@@ -212,6 +219,12 @@ public class ReAligner {
 		
 		writer = new SortedSAMWriter(outputFiles, tempDir.toString(), samHeaders, isKeepTmp, chromosomeChunker,
 				finalCompressionLevel, shouldSort, maxRealignDist, shouldUnsetDuplicates, shouldCreateIndex, shouldUseGkl, maxReadsInRamForSort);
+
+		// =========== 启用并行排序 ===========
+		int sortThreads = Math.max(numThreads, 1);
+		writer.setNumSortThreads(sortThreads);
+		Logger.info("Enabled parallel sorting with %d threads", sortThreads);
+		// ====================================
 
 		// Spawn thread for each chromosome
 		// TODO: Validate identical sequence dictionary for each input file
