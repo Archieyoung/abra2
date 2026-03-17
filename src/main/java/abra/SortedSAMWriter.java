@@ -317,7 +317,6 @@ public class SortedSAMWriter {
 		processUnmappedMultiThreads(outputUnmapedBam, inputBam);
 		chromosomeTempFiles.put("unmaped", unmapTempFile.getAbsolutePath());
 		// 按染色体顺序合并所有临时文件
-		// mergeChromosomeTempFiles(sampleIdx, chromosomes, chromosomeTempFiles, inputBam);
 		mergeBams(sampleIdx, chromosomeTempFiles, true);
 		long endTime = System.currentTimeMillis();
 		Logger.info("Total parallel sort time: %dms", endTime - startTime);
@@ -472,433 +471,42 @@ public class SortedSAMWriter {
 		
 		return tempFileName;
 	}
+
+	private void processUnmappedMultiThreads(SAMFileWriter output, String inputBam) throws IOException {
+	    Logger.debug("Processing unmapped reads with multi-threading...");
 	
-/**
- * 按染色体顺序合并所有临时文件 - 多线程读取 + 异步写入
- * 
- * @param sampleIdx 样本索引
- * @param chromosomes 染色体列表（按顺序）
- * @param chromosomeTempFiles 染色体名称到临时文件的映射
- * @param inputBam 输入BAM文件路径
- * @throws IOException
- */
-private void mergeChromosomeTempFiles(int sampleIdx, List<String> chromosomes,
-	Map<String, String> chromosomeTempFiles, String inputBam) throws IOException {
-
-Logger.info("Starting merge of %d chromosome temp files (multi-threaded read)", chromosomes.size());
-
-long mergeStartTime = System.currentTimeMillis();
-
-// 配置最终输出writer - 启用异步IO和Intel压缩
-if (shouldSort) {
-	// writerFactory.setUseAsyncIo(true);
-	// writerFactory.setAsyncOutputBufferSize(ASYNC_READ_CACHE_SIZE*64);
-	writerFactory.setCreateIndex(shouldCreateIndex);
-
-	IntelDeflaterFactory intelDeflater = new IntelDeflaterFactory();
-	writerFactory.setDeflaterFactory(intelDeflater);
-}
-writerFactory.setCompressionLevel(finalCompressionLevel);
-
-// // 1. 基础配置：速度优先，关闭不必要的校验
-// writerFactory.setValidationStringency(ValidationStringency.SILENT) // 关闭格式校验
-//              .setCompressionLevel(finalCompressionLevel)
-//              .setCreateMd5File(false); // 关闭MD5生成（除非业务必需）
-
-// // 2. 异步IO深度优化（关键！原配置缺少核心参数）
-// if (shouldSort) {
-//     writerFactory.setUseAsyncIo(true)
-//                  .setAsyncOutputBufferSize(64 * 1024 * 1024) 
-//                  .setAsyncIoThreadPoolSize(16)
-//                  .setCreateIndex(shouldCreateIndex);
-// } else {
-//     writerFactory.setUseAsyncIo(false);
-// }
-
-
-if (shouldSort) {
-	samHeaders[sampleIdx].setSortOrder(SortOrder.coordinate);
-} else {
-	samHeaders[sampleIdx].setSortOrder(SortOrder.unsorted);
-}
-
-SAMFileWriter output = writerFactory.makeBAMWriter(
-	samHeaders[sampleIdx], true, new File(outputFiles[sampleIdx]), finalCompressionLevel);
-
-// 统计
-AtomicInteger totalReads = new AtomicInteger(0);
-AtomicInteger processedChroms = new AtomicInteger(0);
-
-try {
-	// 按染色体顺序处理（保证输出顺序）
-	for (String chromosome : chromosomes) {
-		String tempFileName = chromosomeTempFiles.get(chromosome);
+	    File bamFile = new File(inputBam);
+	    File baiFile = new File(inputBam + ".bai");
+	
+	    // 使用多线程读取 unmapped reads
+	    MultiThreadUnmappedReader unmappedReader = new MultiThreadUnmappedReader(
+	        bamFile, baiFile, this.numSortThreads);
 		
-		if (tempFileName != null) {
-			File tempFile = new File(tempFileName);
-			
-			if (tempFile.exists()) {
-				Logger.debug("Merging chromosome: %s, file: %s", chromosome, tempFileName);
-				
-				// 直接读取并写入
-				int chromReads = mergeChromosomeFile(tempFile, output);
-				totalReads.addAndGet(chromReads);
-				processedChroms.incrementAndGet();
-				
-				// 删除临时文件
-				if (!isKeepTmp) {
-					tempFile.delete();
-					Logger.debug("Deleted temp file: %s", tempFileName);
+	    try {
+	        List<SAMRecord> unmappedReads = unmappedReader.readAllUnmapped();
+		
+	        // 写入输出
+	        for (SAMRecord read : unmappedReads) {
+	            output.addAlignment(read);
+	        }
+		
+	        Logger.debug("Wrote %d unmapped reads", unmappedReads.size());
+		
+	    } catch (Exception e) {
+	        Logger.info("Multi-threaded unmapped read failed, falling back to single thread");
+	        // 降级到原来的单线程实现
+	        processUnmapped(output, inputBam);
+	    }
+		finally {
+			try {
+				if (output != null) {
+					output.close();
 				}
-				
-				Logger.debug("Merged chromosome %s: %d reads", chromosome, chromReads);
-			} else {
-				Logger.warn("Temp file not found for chromosome: " + chromosome);
+			} catch (Exception e) {
+				Logger.error("Failed to close output writer");
 			}
 		}
 	}
-	
-	// 处理 unmapped reads
-	processUnmapped(output, inputBam);
-	
-} finally {
-	output.close();
-}
-
-long mergeEndTime = System.currentTimeMillis();
-Logger.info("Merge completed: %d chromosomes, %d reads, time=%dms", 
-		processedChroms.get(), totalReads.get(), mergeEndTime - mergeStartTime);
-}
-
-/**
-* 合并单个染色体临时文件
-* 使用高效的流式读取
-*/
-private int mergeChromosomeFile(File tempFile, SAMFileWriter output) throws IOException {
-SamReader reader = SAMRecordUtils.getSamReader(tempFile.getAbsolutePath());
-
-int readCount = 0;
-try {
-	for (SAMRecord read : reader) {
-		output.addAlignment(read);
-		readCount++;
-	}
-} finally {
-	reader.close();
-}
-
-return readCount;
-}
-
-/**
-* 写入BAM文件头
-*/
-private long writeBamHeader(int sampleIdx, File outputFile) throws IOException {
-FileOutputStream fos = new FileOutputStream(outputFile);
-BufferedOutputStream bos = new BufferedOutputStream(fos, 256 * 1024);
-BlockCompressedOutputStream bgzfOut = new BlockCompressedOutputStream(bos, null, finalCompressionLevel);
-
-try {
-	// 写入BAM magic字符串
-	byte[] magic = "BAM\1".getBytes();
-	bgzfOut.write(magic);
-	
-	// 写入header文本长度和内容
-	String headerText = samHeaders[sampleIdx].getTextHeader();
-	byte[] headerBytes = headerText != null ? headerText.getBytes() : new byte[0];
-	ByteBuffer lenBuf = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
-	lenBuf.putInt(headerBytes.length);
-	bgzfOut.write(lenBuf.array());
-	if (headerBytes.length > 0) {
-		bgzfOut.write(headerBytes);
-	}
-	
-	// 写入参考序列数量
-	int numRefs = samHeaders[sampleIdx].getSequenceDictionary().size();
-	lenBuf.rewind();
-	lenBuf.putInt(numRefs);
-	bgzfOut.write(lenBuf.array());
-	
-	// 写入每个参考序列信息
-	for (int i = 0; i < numRefs; i++) {
-		String name = samHeaders[sampleIdx].getSequence(i).getSequenceName();
-		int length = samHeaders[sampleIdx].getSequence(i).getSequenceLength();
-		
-		byte[] nameBytes = name.getBytes();
-		lenBuf.rewind();
-		lenBuf.putInt(nameBytes.length + 1);  // +1 for null terminator
-		bgzfOut.write(lenBuf.array());
-		bgzfOut.write(nameBytes);
-		bgzfOut.write(0);  // null terminator
-		
-		lenBuf.rewind();
-		lenBuf.putInt(length);
-		bgzfOut.write(lenBuf.array());
-	}
-	
-	bgzfOut.flush();
-	bos.flush();
-	
-	// 返回当前位置（header结束位置）
-	// 注意：由于BGZF压缩，实际文件位置和逻辑位置不同
-	// 这里返回的是文件实际位置
-	return outputFile.length();
-	
-} finally {
-	bgzfOut.close();
-	bos.close();
-	fos.close();
-}
-}
-
-/**
- * 从临时BAM文件复制数据块（跳过header）
- * @return long[0]=read count, long[1]=bytes copied
- */
-private long[] copyBamDataBlocks(File tempFile, BlockCompressedOutputStream bgzfOut) throws IOException {
-    long readCount = 0;
-    long bytesCopied = 0;
-
-    FileInputStream fis = new FileInputStream(tempFile);
-    BufferedInputStream bis = new BufferedInputStream(fis, 256 * 1024);
-    BlockCompressedInputStream bgzfIn = new BlockCompressedInputStream(bis);
-
-    try {
-        // 读取并跳过BAM header
-        byte[] magic = new byte[4];
-        readFully(bgzfIn, magic);
-        
-        // 验证magic
-        if (magic[0] != 'B' || magic[1] != 'A' || magic[2] != 'M' || magic[3] != 1) {
-            throw new IOException("Invalid BAM magic in temp file: " + tempFile.getName());
-        }
-        
-        // 读取header text长度并跳过
-        byte[] lenBytes = new byte[4];
-        readFully(bgzfIn, lenBytes);
-        int headerLen = ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-        if (headerLen > 0) {
-            byte[] headerText = new byte[headerLen];
-            readFully(bgzfIn, headerText);
-        }
-        
-        // 读取参考序列数量并跳过
-        readFully(bgzfIn, lenBytes);
-        int numRefs = ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-        
-        // 跳过每个参考序列信息
-        for (int i = 0; i < numRefs; i++) {
-            readFully(bgzfIn, lenBytes);
-            int nameLen = ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-            byte[] nameBytes = new byte[nameLen];
-            readFully(bgzfIn, nameBytes);
-            readFully(bgzfIn, lenBytes);  // sequence length
-        }
-        
-        // 现在开始读取对齐记录并写入输出
-        byte[] recordLenBytes = new byte[4];
-        while (true) {
-            int bytesRead = readFully(bgzfIn, recordLenBytes);
-            if (bytesRead == -1) {
-                break;  // EOF
-            }
-            
-            int recordLen = ByteBuffer.wrap(recordLenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-            
-            // 写入记录长度
-            bgzfOut.write(recordLenBytes);
-            
-            // 读取并写入记录内容
-            if (recordLen > 0) {
-                byte[] recordData = new byte[recordLen];
-                readFully(bgzfIn, recordData);
-                bgzfOut.write(recordData);
-                bytesCopied += 4 + recordLen;
-            }
-            
-            readCount++;
-        }
-        
-    } finally {
-        bgzfIn.close();
-        bis.close();
-        fis.close();
-    }
-
-    return new long[]{readCount, bytesCopied};
-}
-
-/**
- * 辅助方法：完全读取指定长度的字节数组
- * @return 实际读取的字节数，-1表示EOF
- */
-private int readFully(BlockCompressedInputStream in, byte[] buffer) throws IOException {
-    int totalRead = 0;
-    int remaining = buffer.length;
-    
-    while (remaining > 0) {
-        int bytesRead = in.read(buffer, totalRead, remaining);
-        if (bytesRead == -1) {
-            if (totalRead == 0) {
-                return -1;  // EOF
-            }
-            throw new IOException("Unexpected end of stream. Expected " + buffer.length + " bytes, got " + totalRead);
-        }
-        totalRead += bytesRead;
-        remaining -= bytesRead;
-    }
-    
-    return totalRead;
-}
-
-
-/**
-* 追加unmapped reads到输出文件
-*/
-private void appendUnmappedReads(File outputFile, String inputBam, int sampleIdx) throws IOException {
-// 使用临时文件来处理unmapped
-File tempUnmapped = new File(outputFile.getParent(), "temp_unmapped.bam");
-
-try {
-	// 创建临时writer写入unmapped
-	SAMFileWriterFactory tempFactory = new SAMFileWriterFactory();
-	tempFactory.setCompressionLevel(finalCompressionLevel);
-	SAMFileWriter tempWriter = tempFactory.makeBAMWriter(samHeaders[sampleIdx], false, tempUnmapped, finalCompressionLevel);
-	
-	SamReader reader = SAMRecordUtils.getSamReader(inputBam);
-	Iterator<SAMRecord> iter = reader.queryUnmapped();
-	
-	int unmappedCount = 0;
-	while (iter.hasNext()) {
-		SAMRecord read = iter.next();
-		tempWriter.addAlignment(read);
-		unmappedCount++;
-	}
-	
-	reader.close();
-	tempWriter.close();
-	
-	if (unmappedCount > 0) {
-		// 将unmapped数据追加到主文件
-		appendBamData(outputFile, tempUnmapped);
-		Logger.debug("Appended %d unmapped reads", unmappedCount);
-	}
-	
-} finally {
-	if (tempUnmapped.exists()) {
-		tempUnmapped.delete();
-	}
-}
-}
-
-/**
-* 将sourceBam的数据部分追加到destBam
-*/
-private void appendBamData(File destBam, File sourceBam) throws IOException {
-    // 以追加模式打开目标文件
-    FileOutputStream fos = new FileOutputStream(destBam, true);
-    BufferedOutputStream bos = new BufferedOutputStream(fos, 256 * 1024);
-    BlockCompressedOutputStream bgzfOut = new BlockCompressedOutputStream(bos, null, finalCompressionLevel);
-
-    FileInputStream fis = new FileInputStream(sourceBam);
-    BufferedInputStream bis = new BufferedInputStream(fis, 256 * 1024);
-    BlockCompressedInputStream bgzfIn = new BlockCompressedInputStream(bis);
-
-    try {
-        // 跳过source的header
-        byte[] magic = new byte[4];
-        readFully(bgzfIn, magic);
-        
-        byte[] lenBytes = new byte[4];
-        readFully(bgzfIn, lenBytes);
-        int headerLen = ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-        if (headerLen > 0) {
-            byte[] headerText = new byte[headerLen];
-            readFully(bgzfIn, headerText);
-        }
-        
-        readFully(bgzfIn, lenBytes);
-        int numRefs = ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-        
-        for (int i = 0; i < numRefs; i++) {
-            readFully(bgzfIn, lenBytes);
-            int nameLen = ByteBuffer.wrap(lenBytes).order(ByteOrder.LITTLE_ENDIAN).getInt();
-            byte[] nameBytes = new byte[nameLen];
-            readFully(bgzfIn, nameBytes);
-            readFully(bgzfIn, lenBytes);
-        }
-        
-        // 复制所有记录
-        byte[] buffer = new byte[64 * 1024];
-        int bytesRead;
-        while ((bytesRead = bgzfIn.read(buffer)) != -1) {
-            bgzfOut.write(buffer, 0, bytesRead);
-        }
-        
-    } finally {
-        bgzfIn.close();
-        bis.close();
-        fis.close();
-        bgzfOut.close();
-        bos.close();
-        fos.close();
-    }
-}
-
-
-/**
- * 创建BAM索引
- */
-private void createBamIndex(File bamFile) throws IOException {
-    // 使用SamReaderFactory创建reader
-    SamReader reader = SamReaderFactory.make()
-            .validationStringency(ValidationStringency.SILENT)
-            .open(bamFile);
-    
-    try {
-        // 使用BAMIndexer创建索引
-        htsjdk.samtools.BAMIndexer.createIndex(reader, 
-            new File(bamFile.getAbsolutePath() + ".bai"));
-    } finally {
-        reader.close();
-    }
-}
-
-private void processUnmappedMultiThreads(SAMFileWriter output, String inputBam) throws IOException {
-    Logger.debug("Processing unmapped reads with multi-threading...");
-    
-    File bamFile = new File(inputBam);
-    File baiFile = new File(inputBam + ".bai");
-    
-    // 使用多线程读取 unmapped reads
-    MultiThreadUnmappedReader unmappedReader = new MultiThreadUnmappedReader(
-        bamFile, baiFile, this.numSortThreads);
-    
-    try {
-        List<SAMRecord> unmappedReads = unmappedReader.readAllUnmapped();
-        
-        // 写入输出
-        for (SAMRecord read : unmappedReads) {
-            output.addAlignment(read);
-        }
-        
-        Logger.debug("Wrote %d unmapped reads", unmappedReads.size());
-        
-    } catch (Exception e) {
-        Logger.info("Multi-threaded unmapped read failed, falling back to single thread");
-        // 降级到原来的单线程实现
-        processUnmapped(output, inputBam);
-    }
-	finally {
-		try {
-			if (output != null) {
-				output.close();
-			}
-		} catch (Exception e) {
-			Logger.error("Failed to close output writer");
-		}
-	}
-}
 	
 	private void setMateInfo(SAMRecord read, Map<MateKey, SAMRecord> mates) {
 		
@@ -1154,23 +762,23 @@ private void processUnmappedMultiThreads(SAMFileWriter output, String inputBam) 
 	}
 
 	/**
- * 设置排序线程数
- * @param numThreads 线程数
- */
-public void setNumSortThreads(int numThreads) {
-    this.numSortThreads = Math.max(1, numThreads);
-    if (numThreads > 1) {
-        this.enableParallelSort = true;
-    }
-}
+ 	* 设置排序线程数
+ 	* @param numThreads 线程数
+ 	*/
+	public void setNumSortThreads(int numThreads) {
+    	this.numSortThreads = Math.max(1, numThreads);
+    	if (numThreads > 1) {
+        	this.enableParallelSort = true;
+    	}
+	}
 
-/**
- * 获取排序线程数
- * @return 线程数
- */
-public int getNumSortThreads() {
-    return numSortThreads;
-}
+	/**
+	 * 获取排序线程数
+	 * @return 线程数
+	 */
+	public int getNumSortThreads() {
+	    return numSortThreads;
+	}
 	
 	static class SAMCoordinateComparator implements Comparator<SAMRecord> {
 
